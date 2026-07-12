@@ -1,0 +1,10 @@
+FROM eclipse-temurin:21-jdk-alpine
+
+WORKDIR /app
+
+COPY Dedup.java .
+
+RUN javac Dedup.java
+
+WORKDIR /data
+ENTRYPOINT ["java", "-cp", "/app", "-Xmx48m", "-XX:+UseSerialGC", "Dedup"]
