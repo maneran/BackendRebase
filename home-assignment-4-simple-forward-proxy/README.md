@@ -1,6 +1,7 @@
 # Home Assignment 4: HTTP Forward Proxy
 
-A GET-only forward proxy. Both levels: no framework, no dependencies, no build tool.
+A proxy that fetches web pages on someone else's behalf. GET only. Both levels: no framework, no
+dependencies, no build tool.
 
 ```bash
 javac ProxyServer.java
@@ -14,80 +15,119 @@ curl "http://httpbin.org/uuid" -x 127.0.0.1:43210
 curl "http://httpbin.org/image/png" -x 127.0.0.1:43210 -o my_image.png
 ```
 
-## What a proxy has to get right
+The `-x` is what tells curl "don't go to the website yourself — ask this proxy to go for you".
 
-An ordinary server is asked for a path. A proxy is asked for a **whole URL**:
+## What a proxy is
 
-```
-direct    GET /uuid HTTP/1.1              Host: httpbin.org
-proxied   GET http://httpbin.org/uuid HTTP/1.1
-```
+Think of someone who runs errands for you.
 
-That difference is the entire job. The client cannot reach the destination itself, so it hands
-over the full address and the proxy makes the request on its behalf. Three things follow, and
-they are what the rest of this document is about:
+You want something from a shop, but you cannot go yourself. So you write the shop's **full
+address** on a piece of paper, hand it to your errand runner, and they walk there, buy the thing,
+and bring it back to you exactly as they received it.
 
-1. **The destination comes from the request line**, not from configuration.
-2. **The client's headers belong to the destination**, not to the proxy — with the exception of
-   the ones that describe the client-to-proxy connection itself.
-3. **The proxy's own opinions do not belong in the response.** Whatever the destination said,
-   status and headers and bytes, is what the client gets.
+That is the whole job. This program is the errand runner. The shop is a website.
 
-## How it works
+**Why the full address matters.** When you go to a shop yourself, you already know which shop you
+are standing in — you only need to say which aisle. When you send someone else, they have no idea
+where to go unless you tell them. The same is true here:
 
 ```
-client  ──GET http://host/path──▶  proxy  ──GET /path──▶  destination
-                                     │
-        ◀── status + headers ────────┤ ◀── status + headers ──
-        ◀── body, chunk by chunk ────┘ ◀── body ─────────────
+you go yourself     GET /uuid HTTP/1.1              Host: httpbin.org
+you send the proxy  GET http://httpbin.org/uuid HTTP/1.1
 ```
 
-| Step | Takes in | Gives out |
+The second line contains the whole address. That single difference is what makes a request a
+proxy request, and everything else in this document follows from it.
+
+**The errand runner does not shop for themselves.** Three rules come out of that:
+
+1. **They go where the paper says.** The destination comes from the request, never from settings.
+2. **They carry your message, not their own.** Your requests to the shop are passed along
+   untouched — except for notes that were meant for the runner personally, which is a distinction
+   the next section is about.
+3. **They bring back what they were given.** Whatever the shop said — even "we are closed" — is
+   what you get. The runner does not improve it, replace it, or add opinions.
+
+## What happens during a request
+
+```
+you  ──"go to http://host/path"──▶  proxy  ──"give me /path"──▶  website
+                                      │
+     ◀── the website's answer ────────┤ ◀── the answer ──
+     ◀── the goods, armful by armful ─┘ ◀── the goods ───
+```
+
+1. **Check the request** — is this something the proxy can do, and where is it going?
+2. **Repack it** — copy your headers, leaving out the ones meant only for the proxy.
+3. **Go and ask** — make the request to the website.
+4. **Bring it back** — send the website's answer to you, a piece at a time.
+
+### The parts
+
+| Part | Takes in | Gives out |
 |---|---|---|
-| **Validate** | the request line | the destination URI, or a rejection |
-| **Build** | the client's headers | an upstream request minus the hop-by-hop ones |
-| **Send** | the upstream request | the destination's status, headers, and an open body stream |
-| **Relay** | that response | the same status and headers, then the body a chunk at a time |
+| **Checker** | the request | the destination address, or a refusal |
+| **Repacker** | your headers | a request for the website, minus the private notes |
+| **Fetcher** | that request | the website's answer and an open pipe to its contents |
+| **Relay** | that answer | the same answer to you, a piece at a time |
 
-### Validate
+## Checking the request
 
-Two checks, and both map to a status that names the real problem.
+A **header** is a line of extra information attached to a request — things like which languages
+you read, or what browser you are using. They travel alongside the actual message.
 
-**The method must be GET.** Anything else is `501 Not Implemented`, not `405`. The difference is
-who the statement is about: `405` says the method is wrong *for that resource*, which is a claim
-about the destination — and this proxy never asked it. `501` says this server does not implement
-the method, which is the only thing actually known.
+Two checks happen before anything else, and each refusal uses a number that names the real
+problem.
 
-**The target must be an absolute `http://` URI.** A bare path means someone pointed a normal HTTP
-client at this port, so there is no destination to derive — `400`. An `https://` target is
-`501`: HTTPS through a proxy is a `CONNECT` tunnel, not a forwarded GET.
+**It must be a GET.** GET means "give me this thing". This proxy does nothing else, so anything
+else is refused with **501**, which means *this server does not know how to do that*. The
+tempting alternative, 405, means *that website will not allow this* — and the proxy has not asked
+the website, so saying 405 would be putting words in its mouth.
 
-### Build
+**There must be a full address.** If the request only has a path (`/nope`) and no website name,
+someone has pointed an ordinary browser straight at the proxy. There is no shop on the paper, so
+there is nowhere to go: **400**, meaning *the request itself is wrong*.
 
-Every client header is copied to the upstream request except those in one list:
+An `https://` address is refused with 501 too. Secure websites work in a completely different way
+through a proxy — the runner carries a sealed box they cannot open — and that is not built here.
+
+## Which headers get passed on
+
+Almost all of them. Your headers are addressed to the website, so the proxy carries them over
+untouched.
+
+Eight are left behind:
 
 ```
 connection   keep-alive   proxy-authenticate   proxy-authorization
 te           trailer      transfer-encoding    upgrade
 ```
 
-**Why these are excluded.** They describe *this connection* rather than the message being
-carried, so they are meaningful only between two adjacent parties. `Connection: keep-alive` is an
-agreement between the client and the proxy about their own socket; passing it on would make a
-promise to the destination on someone else's behalf. The term for this is **hop-by-hop**, as
-opposed to end-to-end headers like `Accept` or `Cookie`, which are addressed to the destination
-and travel untouched.
+**Why leave any behind?** Because some notes are meant for the errand runner personally, not for
+the shop.
 
-Two additions to the assignment's list:
+If you tell your runner *"wait for me at the door when you get back"*, that instruction is
+between you and them. Repeating it to the shopkeeper would be nonsense — and worse, it would be
+making a promise to the shop on someone else's behalf.
 
-- **`Proxy-Connection`** — non-standard, but curl sends it on every proxied request, and it is
-  hop-by-hop by exactly the same reasoning as `Connection`.
-- **`Content-Length`** — the request payload is empty by assumption, so there is nothing to
-  describe. On the response side it is excluded for a different reason: the length is not a
-  header this server writes but an argument it passes (see *Framing* below), so forwarding it
-  would declare the length twice.
+That is exactly what these eight headers are. `Connection: keep-alive` means "let's keep our own
+line open" — an agreement between you and the proxy about your own connection. The website is not
+part of that conversation. The technical name for such a header is **hop-by-hop**: it belongs to
+one leg of the journey only. Headers like `Accept` or `Cookie` are the opposite — they are meant
+for the far end and travel the whole way.
 
-Verified by pointing the proxy at a destination that prints the raw bytes it received:
+Two more are left behind, beyond the eight the assignment lists:
+
+- **`Proxy-Connection`** — not an official header, but curl sends it every single time you use
+  `-x`. It is a note for the proxy by its very name, so it stays behind for the same reason as
+  `Connection`.
+- **`Content-Length`** — this says how many bytes the message body is. Requests here never have a
+  body, so there is nothing to measure. Coming back the other way it is left out for a different
+  reason: the proxy states the length through a separate mechanism (see *Saying how long the
+  answer is*), so keeping the header too would state it twice.
+
+**Checked, not assumed.** The proxy was pointed at a fake website that prints the exact bytes it
+receives:
 
 ```
 curl -x 127.0.0.1:43210 -H "X-Custom: forward-me" -H "Cookie: a=1" -H "Cookie: b=2" \
@@ -96,8 +136,10 @@ curl -x 127.0.0.1:43210 -H "X-Custom: forward-me" -H "Cookie: a=1" -H "Cookie: b
      "http://127.0.0.1:43220/some/path?q=1"
 ```
 
+What the fake website actually got:
+
 ```
-GET /some/path?q=1 HTTP/1.1        ← origin-form: the absolute URI is for the proxy, not the destination
+GET /some/path?q=1 HTTP/1.1        ← just the path now: the full address was only for the proxy
 Accept: */*
 Accept-language: he-IL
 Host: 127.0.0.1:43220
@@ -106,161 +148,176 @@ X-custom: forward-me
 Cookie: a=1; b=2
 ```
 
-All eight hop-by-hop headers gone, everything else through, and no `Upgrade` or `HTTP2-Settings`
-of the proxy's own invention.
+All the private notes gone, everything else carried across, and nothing invented along the way.
 
-### Send
+## Going and asking
 
-One `HttpClient` for the whole proxy, because it owns the connection pool — a client per request
-would open a fresh TCP connection every time and never reuse one. Three settings are deliberate.
+One connection-handler is shared by the whole proxy rather than made fresh each time. Making a
+new one per request would mean dialling the website from scratch every time instead of reusing a
+line that is already open.
 
-**HTTP/1.1 is pinned.** Left at its default, `HttpClient` advertises an upgrade to h2c on every
-cleartext request, which adds `Upgrade` and `HTTP2-Settings` headers the client never sent — and
-`Upgrade` is a header this proxy is specifically told not to forward.
+Three settings are deliberate.
 
-**Redirects are not followed** (the default, kept on purpose). A proxy hands the `3xx` back and
-lets the client decide. Following it would return a body from a URL the client never asked for,
-under a status saying otherwise.
+**Speak the older, simpler version of HTTP.** Left to itself, Java's web client adds a note to
+every request offering to switch to a newer protocol version. That note is an `Upgrade` header —
+and `Upgrade` is on the list of headers this proxy is specifically told never to send. It would
+have been inventing the exact thing it was told to remove.
 
-**Only the connect timeout is set**, at 10 seconds. A request timeout would run against the whole
-response, and killing a large but healthy download part way through is worse than waiting for it.
+**Do not chase redirects.** A **redirect** is a website saying "what you want has moved, try over
+there". A good errand runner brings that message back and lets you decide. Chasing it would mean
+returning goods from a shop you never named, while the receipt says otherwise.
 
-#### Forwarding `Host`
+**Only limit how long to wait for the shop to open the door** — ten seconds — not how long the
+shopping takes. A time limit on the whole errand would abandon a large, perfectly healthy
+download halfway through.
 
-`HttpClient` refuses a caller-supplied `Host` — it is on a *restricted header* list, meaning a
-list of headers the client insists on controlling itself, because an ordinary application has no
-business overriding them. A proxy does: forwarding the client's headers is the whole job. The
-restriction is lifted for `Host` alone:
+### Passing on the `Host` header
+
+`Host` is the header naming which website you want. Java's web client normally **refuses** to let
+a program set it, because a normal program has no business claiming to be a different website.
+A proxy does have that business — passing your headers on is its entire purpose — so that refusal
+is lifted for this one header:
 
 ```java
 System.setProperty("jdk.httpclient.allowRestrictedHeaders", "host");
 ```
 
-**This must run before any `java.net.http` class initialises** — the permitted set is read once,
-in a static initialiser — which is why it is the first statement in `main` rather than sitting
-next to the client it configures.
+**This has to be the very first line of the program.** Java reads that setting once, when the web
+client machinery first wakes up, and never looks again. Put it lower down and it is simply
+ignored — which is why it sits alone at the top instead of next to the client it configures.
 
-In practice the regenerated `Host` and the forwarded one are usually identical, since both derive
-from the same URL. They differ only when a client deliberately sends a `Host` that disagrees with
-its own request line, and forwarding it is the more faithful reading of "every request header".
+## When the website cannot be reached
 
-#### When the destination cannot be reached
+If the errand runner cannot find the shop, that is not the runner's fault, and the message back
+should say so. These numbers do:
 
-These are not this proxy failing; they are this proxy reporting that the destination could not be
-reached. `502` and `504` say that, where `500` would blame the wrong machine.
+| What went wrong | Number | What it means |
+|---|---|---|
+| The website's name does not exist | 502 | *I could not get a good answer from them* |
+| The website refused the connection | 502 | same |
+| Anything else went wrong on the way | 502 | same |
+| The website never answered the door | 504 | *they took too long* |
 
-| Condition | Status |
-|---|---|
-| Host does not resolve | 502 |
-| Connection refused | 502 |
-| Any other upstream IO failure | 502 |
-| Timed out connecting | 504 |
+The wrong choice here would be 500, which means *I broke*. The proxy did not break; the
+destination did, and blaming the wrong machine sends whoever is debugging to the wrong place.
 
-**Failures are identified by walking the cause chain, not by catching a type.** A failed lookup
-arrives as a `ConnectException` with the real reason buried two levels down, so a `catch` clause
-on that reason never runs — it is only ever a cause, never the throwable:
+**Finding the real reason takes digging.** When a website's name cannot be looked up, Java does
+not report that plainly. It reports "could not connect", with the true reason buried two layers
+underneath:
 
 ```
 java.net.ConnectException : null
 java.net.ConnectException : null
-java.nio.channels.UnresolvedAddressException : null
+java.nio.channels.UnresolvedAddressException : null      ← the actual reason
 ```
 
-Note *which* reason. `HttpClient`'s NIO path reports `UnresolvedAddressException`, which is not
-even an `IOException`; `UnknownHostException` is what the blocking path throws. Both are checked,
-because testing only the familiar one silently mislabels every DNS failure as a refused
-connection — which points debugging at the wrong machine. The first version of this code did
-exactly that, and reported `Cannot connect to ... - null`.
+So the proxy digs down through the layers instead of looking only at the top one. It also checks
+for *two* different names for this failure, because Java uses different ones depending on how it
+looked up the address. The first version of this code checked only the better-known name, found
+nothing, and reported every unknown website as "connection refused" — pointing debugging at the
+wrong problem entirely.
 
-### Relay
+## Bringing the answer back
 
-The destination's status and headers go back to the client with the same hop-by-hop list removed,
-then the body is copied.
+The website's answer — its number, its headers, its contents — goes straight back to you, with
+the same eight private notes removed.
 
-#### Framing
+### Saying how long the answer is
 
-`HttpServer` takes the response length as a single argument whose three values are not sizes but
+Before sending anything, the proxy must say how much is coming. Java takes this as a single
+number, and the three possible values are not really lengths at all — they are three different
 modes:
 
-| Value | Meaning |
+| Value | What it actually means |
 |---|---|
-| positive | declare that `Content-Length` |
-| `0` | use chunked encoding, length unknown |
-| `-1` | no body at all |
+| a positive number | "expect exactly this many bytes" |
+| `0` | "I don't know yet — I'll tell you when it ends" |
+| `-1` | "there is no content at all" |
 
-The unintuitive one is `0`, which reads like "empty" and means the opposite. So a destination
-that declared a length keeps it; one that did not — it was chunked, or it marks the end by
-closing the connection — is re-chunked by this server. Either way **the length is never obtained
-by reading the body first**, which is what would defeat the point of level 2.
+The trap is `0`. It reads like "empty" and means very nearly the opposite.
 
-`1xx`, `204` and `304` are defined to carry no body and get `-1`. A client stops reading after
-the headers on all three, so announcing a body that never arrives would leave it waiting.
+So: if the website said how big its answer is, that size is passed straight through. If it did
+not, the proxy uses the "I'll tell you when it ends" mode. **What it never does is read the whole
+answer first just to measure it** — which would throw away the entire point of level 2.
+
+Three kinds of answer carry no content by definition, including "nothing has changed since last
+time" (304). Those get `-1`. Promising content that never arrives would leave you waiting forever.
 
 ## Streaming (level 2)
 
-The body is read and written 16KB at a time — comfortably over the 1024 the assignment asks for,
-and twice `InputStream.transferTo`'s built-in 8KB. Nothing accumulates: a chunk is read, written,
-and **flushed** before the next is asked for.
+**The problem.** The simple way to be an errand runner is to collect the entire shop order, load
+it all into your arms, walk back, and only then hand any of it over. That works for a loaf of
+bread. It falls apart for a fridge — you cannot hold it, and the person waiting sees nothing at
+all until you arrive.
 
-The flush is what makes that true rather than merely possible. Without it the chunks pile up in
-the response stream's own buffer and leave in batches — the same buffering this level exists to
-avoid, just moved one layer down.
+**What this does instead.** It carries the answer back in armfuls of 16KB. Read a piece, hand it
+over, push it out the door, go back for the next piece. The proxy never holds more than one
+armful, and you start receiving things while the website is still handing them over.
 
-Two measurements, both against a variant identical except for a buffering
-`BodyHandlers.ofByteArray()` in place of `ofInputStream()`.
+**Pushing it out the door is the part that matters.** Writing a piece is not the same as sending
+it — left alone, the pieces pile up in a holding area and go out in big batches. That is the very
+buffering this level exists to avoid, just hidden one layer deeper. So each piece is explicitly
+flushed out before the next is fetched.
 
-**Time to first byte.** A destination that emits 10 × 100KB with 200ms gaps, so the body takes
-~2s to finish:
+Both claims were measured against an otherwise identical copy of the proxy, changed in exactly
+one way: it collects the whole answer before replying.
+
+**Does it really start early?** A fake website that sends its answer in 10 slow pieces, dribbled
+out over about two seconds:
 
 ```
-direct    first byte 0.075s   total 1.880s   1024000 bytes
-proxied   first byte 0.006s   total 1.813s   1024000 bytes
+straight to the website   first byte 0.075s   total 1.880s   1024000 bytes
+through the proxy         first byte 0.006s   total 1.813s   1024000 bytes
 ```
 
-First byte at 6ms against a transfer that runs for 1.8s. A proxy that read the response before
-answering could not produce that number — its first byte cannot precede the destination's last.
+The first byte arrives in 6 thousandths of a second, on a delivery that keeps going for another
+1.8 seconds. A proxy that collected everything first could not possibly produce that number — its
+first byte cannot arrive before the website's last one.
 
-**Memory.** A 100MB response through a proxy given a 32MB heap:
+**Does it really stay small?** A 100MB answer, through a proxy deliberately given only 32MB of
+memory to work with:
 
-| | status | delivered | `OutOfMemoryError` |
+| | result | delivered | ran out of memory |
 |---|---|---|---|
-| streaming | 200 | 104,857,600 bytes | 0 |
-| buffering | — | 0 bytes | 2 |
+| this proxy (armfuls) | worked | all 104,857,600 bytes | never |
+| the collecting copy | failed | 0 bytes | twice |
 
-The streaming proxy relays a body three times the size of its entire heap, because it never holds
-more than 16KB of it.
+It carried something three times larger than all the memory it had, because it never held more
+than 16KB of it at once.
 
-**Integrity.** Both image URLs fetched directly and through the proxy are byte-identical, and
-still valid images:
+**Do the goods arrive undamaged?** Both test images, fetched directly and through the proxy, are
+identical byte for byte and still open as images:
 
 ```
 IDENTICAL  496997 bytes  pngs-img-arena.png    PNG image data, 736 x 2026, 8-bit/color RGB, interlaced
 IDENTICAL    5783 bytes  Logo_JPEG_Jubilaeum_33_small.png
 ```
 
-Eight concurrent 497KB transfers: 8/8 byte-identical.
+Eight of those downloads running at the same time: 8 out of 8 identical.
 
-## Errors and logging
+## When things go wrong mid-delivery
 
-A client hanging up mid-download is **routine** — every `curl -m` timeout and every Ctrl-C does
-it — so it costs one line:
+People change their minds. Someone presses Ctrl-C, or a time limit runs out, and they walk away
+while the download is still going. **This is completely normal**, so it costs exactly one line:
 
 ```
 relay stopped http://127.0.0.1:43221/ - after 524204 bytes, client or destination went away (IOException: Broken pipe)
 ```
 
-It is a type of its own (`RelayFailure`) rather than a `ProxyException` because by that point
-there is no status left to send: the response was committed the moment the status line went out.
-All that remains is the log entry, which is exactly why it must not be reported as a fault. The
-first version let it reach the generic handler and printed a 20-line stack trace per abandoned
-download, which would bury a real failure.
+The first version treated it as a crash and printed twenty lines of error trace for every
+abandoned download — noise that would bury a genuine problem.
 
-The message names both ends rather than picking one. A failed write cannot distinguish a client
-that hung up from a destination that died, and once the response is committed neither can be
-reported nor repaired — so it says so instead of guessing.
+It gets its own error type for a specific reason: by the time it happens, the answer's headers
+have already been sent, so there is no status code left to send. There is nothing to fix and
+nothing to tell anyone. All that remains is the log line, which is precisely why it must not look
+like a disaster.
 
-Everything else keeps the split from assignment 3: a `ProxyException` carries the status the
-client should get and logs one line; anything else is a bug in this proxy and gets a full stack.
+The message names both possibilities rather than picking one, because at that point they are
+genuinely indistinguishable — a failed handover looks the same whether you walked off or the shop
+did. Guessing would be pretending to know.
+
+Everything else keeps the split from assignment 3: an expected refusal carries the number you
+should get and logs one line, and anything unexpected is a real bug and gets the full trace.
 
 ## Probe suite
 
@@ -270,55 +327,60 @@ curl -s -m 25 -o /dev/null -w "GET png                 -> %{http_code}\n" -x $P 
 curl -s -m 40 -o /dev/null -w "GET big png             -> %{http_code}\n" -x $P http://libpng.org/pub/png/img_png/pngs-img-arena.png
 curl -s -m 25 -o /dev/null -w "GET httpbin/status/404  -> %{http_code}\n" -x $P http://httpbin.org/status/404
 curl -s -m 25 -o /dev/null -w "POST                    -> %{http_code}\n" -X POST -x $P http://httpbin.org/uuid
-curl -s -m 25 -o /dev/null -w "origin-form (no -x)     -> %{http_code}\n" http://127.0.0.1:43210/nope
+curl -s -m 25 -o /dev/null -w "no full address (no -x) -> %{http_code}\n" http://127.0.0.1:43210/nope
 curl -s -m 25 -o /dev/null -w "unresolvable host       -> %{http_code}\n" -x $P http://no-such-host-xyz.invalid/
 curl -s -m 25 -o /dev/null -w "connection refused      -> %{http_code}\n" -x $P http://127.0.0.1:43299/
 ```
 
 Expected: `200 200 404 501 400 502 502`.
 
-A printed `000` is not a status — it means no HTTP response arrived at all.
+A printed `000` is not a status code — it means no answer came back at all.
 
-**`httpbin.org` was intermittently returning `503` and timing out** while this was being tested,
-directly as well as through the proxy, so `status/404` above may come back `503`. That is the
-proxy doing its job: an unhealthy destination's status is forwarded, not replaced. The two image
-hosts were reliable throughout and are the better test targets.
+**`httpbin.org` was broken while this was being tested**, returning 503 and timing out — going to
+it directly, not just through the proxy. So `status/404` above may come back as `503`. That is
+the proxy doing its job correctly: rule 3 is that the website's answer comes back untouched, even
+when the answer is "we are having a bad day". The two image websites worked reliably throughout
+and are the better things to test with.
 
 ## Notes on the implementation
 
-**No dependencies.** `com.sun.net.httpserver` handles the client side and `java.net.http.HttpClient`
-the destination side; both ship with the JDK, so `javac ProxyServer.java` is the whole build.
-Between them they handle request parsing, chunked encoding and connection reuse — a raw-socket
-proxy would have to dechunk the destination's body by hand, since `Transfer-Encoding` is
-hop-by-hop and cannot simply be passed through.
+**No dependencies.** Java already includes both halves — a web server for talking to you, and a
+web client for talking to websites — so `javac ProxyServer.java` is the entire build. Between
+them they handle the fiddly business of splitting messages up and reassembling them. Doing this
+with raw network sockets would mean reassembling the website's answer by hand, because
+`Transfer-Encoding`, the header that explains how the answer was chopped up, is one of the eight
+that must be removed.
 
-**Absolute URIs route to `/`.** `HttpServer` matches contexts on the request URI's path, so a
-context registered at `/` catches every destination path, and `getRequestURI()` hands back the
-full absolute URI with its query intact. Confirmed before anything else was written, because the
-whole design rests on it.
+**Full addresses arrive intact.** Java's built-in server sorts incoming requests by path, so one
+handler registered at `/` catches every possible destination, and the full address is still there
+to read. This was confirmed by experiment before a single line of the proxy was written, because
+the entire design depends on it being true.
 
-**Virtual threads.** Without an executor `HttpServer` serves one request at a time, and a proxy is
-almost entirely blocked waiting on an upstream socket — which is what virtual threads are for.
+**Virtual threads.** Without them the server handles one request at a time. A proxy spends nearly
+all its life waiting for a website to reply, which is exactly the situation virtual threads exist
+for.
 
-**Repeated headers keep all their values, in order.** Collapsing them would change the meaning of
-a repeated `Accept` or `Cookie`.
+**A header sent twice keeps both values, in order.** Merging them would change the meaning of a
+repeated `Accept` or `Cookie`.
 
-**Logging is `System.err`.** A real deployment would use a logging framework; that would mean a
-dependency and a build tool, which is the trade-off this project deliberately avoided.
+**Logging goes to the error stream.** A real deployment would use a proper logging library, but
+that means a dependency and a build tool — the trade-off this project deliberately avoids.
 
 ## Known limitations
 
-- **No `CONNECT`**, so no HTTPS tunnelling. Out of scope, but it is the obvious next level.
-- **Only GET.** Adding the other bodyless methods would be mechanical; anything with a request
-  body would need the payload streamed upstream too.
-- **`Connection`'s listed values are not stripped.** RFC 7230 says a `Connection: X` header makes
-  `X` hop-by-hop for that message as well. This implementation removes the fixed list the
-  assignment gives and no more, so an unusual client could have a header forwarded that should
-  have been dropped.
-- **No `Via` header**, per the assignment.
-- **Header names are re-cased** by `HttpServer` — `User-Agent` arrives as `User-agent` and is
-  forwarded that way. HTTP header names are case-insensitive by definition, so this changes
-  nothing semantically, but a destination that compares them by hand would notice.
-- **`HttpServer` rejects some malformed requests before the handler runs**, e.g. an unparseable
-  `Transfer-Encoding` value gets its own `501` with an HTML body this proxy never wrote.
-- **No cache and no access log.** Every request goes to the destination.
+- **No HTTPS.** Secure websites need a completely different mechanism through a proxy, where the
+  proxy relays a sealed conversation it cannot read. Out of scope here, and the obvious next step.
+- **GET only.** The other request types that have no body would be straightforward to add;
+  anything that sends data would need that data streamed onward too.
+- **`Connection` can name extra headers, and those are not removed.** The rules say a header
+  `Connection: X` also makes `X` private to that one leg of the journey. This removes the fixed
+  list the assignment gives and nothing more, so an unusual client could get a header passed on
+  that should have been left behind.
+- **No `Via` header**, as the assignment allows.
+- **Header names come back slightly re-capitalised** — `User-Agent` becomes `User-agent`. Header
+  names officially ignore capitalisation, so nothing actually changes, but a website comparing
+  them letter by letter would notice.
+- **Some malformed requests are rejected by Java's server before this code ever sees them**, and
+  those refusals come with an HTML page this proxy did not write.
+- **Nothing is remembered between requests.** No cache, so every single request really does go to
+  the website.
